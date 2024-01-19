@@ -1,4 +1,4 @@
-# Copyright 2019-2023 SURF.
+# Copyright 2019-2024 SURF.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -10,20 +10,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import re
 import ssl
+from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Awaitable, Mapping
 from http import HTTPStatus
-from json import JSONDecodeError
-from typing import Any, Callable, Optional, Union, cast
+from typing import Any, Callable, Optional, Union
 
 from fastapi.exceptions import HTTPException
 from fastapi.param_functions import Depends
 from fastapi.requests import Request
 from fastapi.security.http import HTTPBearer
-from httpx import AsyncClient, BasicAuth, NetworkError
+from httpx import AsyncClient, NetworkError
 from pydantic import BaseModel
-from starlette.requests import ClientDisconnect
 from structlog import get_logger
 
 from oauth2_lib.settings import oauth2lib_settings
@@ -71,71 +69,9 @@ class OIDCUserModel(dict):
                 return self.get(key)
             raise error
 
-    """
-    Below this line are SURFnet specific properties that are used often in code to either display or check on.
-    """
-
     @property
     def user_name(self) -> str:
-        if "user_name" in self.keys():
-            return cast(str, self["user_name"])
-        if "unspecified_id" in self.keys():
-            return cast(str, self["unspecified_id"])
         return ""
-
-    @property
-    def display_name(self) -> str:
-        return self.get("display_name", "")  # type: ignore
-
-    @property
-    def principal_name(self) -> str:
-        return self.get("eduperson_principal_name", "")  # type: ignore
-
-    @property
-    def memberships(self) -> list[str]:
-        return self.get("edumember_is_member_of", [])  # type: ignore
-
-    @property
-    def teams(self) -> set[str]:
-        prefix = "urn:collab:group:surfteams.nl:nl:surfnet:diensten:"
-        length = len(prefix)
-        return {urn[length:] for urn in self.memberships if urn.startswith(prefix)}
-
-    @property
-    def entitlements(self) -> list[str]:
-        return self.get("eduperson_entitlement", [])  # type: ignore
-
-    @property
-    def roles(self) -> set[str]:
-        prefix = "urn:mace:surfnet.nl:surfnet.nl:sab:role:"
-        length = len(prefix)
-        return {urn[length:] for urn in self.entitlements if urn.startswith(prefix)}
-
-    @property
-    def organization_codes(self) -> set[str]:
-        prefix = "urn:mace:surfnet.nl:surfnet.nl:sab:organizationCode:"
-        length = len(prefix)
-        return {urn[length:] for urn in self.entitlements if urn.startswith(prefix)}
-
-    @property
-    def organization_guids(self) -> set[str]:
-        prefix = "urn:mace:surfnet.nl:surfnet.nl:sab:organizationGUID:"
-        length = len(prefix)
-        return {urn[length:] for urn in self.entitlements if urn.startswith(prefix)}
-
-    @property
-    def scopes(self) -> set[str]:
-        if isinstance(self.get("scope"), list):
-            return set(self.get("scope"))  # type: ignore
-        return set(re.split("[ ,]", self.get("scope", "")))
-
-    @property
-    def is_resource_server(self) -> bool:
-        return self.get("is_resource_server", False)  # type: ignore
-
-    @property
-    def surf_crm_id(self) -> str:
-        return self.get("surf-crm-id", "")  # type: ignore
 
 
 async def _make_async_client() -> AsyncGenerator[AsyncClient, None]:
@@ -169,34 +105,51 @@ class OPAResult(BaseModel):
     decision_id: str
 
 
-class OIDCUser(HTTPBearer):
-    """OIDCUser class extends the HTTPBearer class to do extra verification.
+class Authenticator(ABC):
+    @abstractmethod
+    async def authenticate(self, request: Request, token: str | None = None) -> dict | None:
+        """Authenticate the user."""
+        pass
+
+class IdTokenExtractor(ABC):
+    @abstractmethod
+    async def extract(self, request):
+        pass
+
+
+class HttpBearerExtractor(IdTokenExtractor):
+    async def extract(self, request):
+        http_bearer = HTTPBearer(auto_error=True)
+        return await http_bearer(request)
+
+
+class OIDCAuth(Authenticator):
+    """OIDCAuth class has the HTTPBearer class to do extra verification.
 
     The class will act as follows:
         1. Validate the Credentials at SURFconext by calling the UserInfo endpoint
         2. When receiving an active token it will enrich the response through the database roles
     """
 
-    openid_config: Union[OIDCConfig, None] = None
-    openid_url: str
-    resource_server_id: str
-    resource_server_secret: str
-
     def __init__(
-        self,
-        openid_url: str,
-        resource_server_id: str,
-        resource_server_secret: str,
-        auto_error: bool = True,
-        scheme_name: Union[str, None] = None,
+            self,
+            openid_url: str,
+            openid_config_url: str,
+            resource_server_id: str,
+            resource_server_secret: str,
+            id_token_extractor: IdTokenExtractor | None = None
     ):
-        super().__init__(auto_error=auto_error)
+        if not id_token_extractor:
+            self.id_token_extractor = HttpBearerExtractor()
+
         self.openid_url = openid_url
+        self.openid_config_url = openid_config_url
         self.resource_server_id = resource_server_id
         self.resource_server_secret = resource_server_secret
-        self.scheme_name = scheme_name or self.__class__.__name__
 
-    async def __call__(self, request: Request, token: Union[str, None] = None) -> Union[OIDCUserModel, None]:  # type: ignore
+        self.openid_config = None
+
+    async def authenticate(self, request: Request, token: str | None = None) -> OIDCUserModel | None:
         """Return the OIDC user from OIDC introspect endpoint.
 
         This is used as a security module in Fastapi projects
@@ -215,77 +168,41 @@ class OIDCUser(HTTPBearer):
         async with AsyncClient(http1=True, verify=HTTPX_SSL_CONTEXT) as async_request:
             await self.check_openid_config(async_request)
 
-            if not token:
-                credentials = await super().__call__(request)
+            if token is None:
+                credentials = await self.id_token_extractor.extract(request)
                 if not credentials:
                     return None
-                token = credentials.credentials
+                token_or_credentials = credentials.credentials
+            elif await self.should_be_skipped(request):
+                return None
+            else:
+                token_or_credentials = token
 
-            user_info = await self.introspect_token(async_request, token)
-
-            if "active" not in user_info:
-                logger.error("Token doesn't have the mandatory 'active' key, probably caused by a caching problem")
-                raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED, detail="Missing active key")
-            if not user_info.get("active", False):
-                logger.info("User is not active", url=request.url, user_info=user_info)
-                raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED, detail="User is not active")
-
+            user_info = await self.userinfo(async_request, token_or_credentials)
             logger.debug("OIDCUserModel object.", user_info=user_info)
             return user_info
+
+    @staticmethod
+    async def should_be_skipped(request: Request) -> bool:
+        return False
+
+    async def userinfo(self, async_request: AsyncClient, token: str) -> OIDCUserModel:
+        """Get the userinfo from the openid server.
+
+        :param AsyncClient async_request: The async request
+        :param str token: the access_token
+        :return: OIDCUserModel: OIDC user model from openid server
+
+        """
+        raise NotImplementedError()
 
     async def check_openid_config(self, async_request: AsyncClient) -> None:
         """Check of openid config is loaded and load if not."""
         if self.openid_config is not None:
             return
 
-        response = await async_request.get(self.openid_url + "/.well-known/openid-configuration")
+        response = await async_request.get(self.openid_config_url)
         self.openid_config = OIDCConfig.parse_obj(response.json())
-
-    async def introspect_token(self, async_request: AsyncClient, token: str) -> OIDCUserModel:
-        """Introspect the access token to retrieve the user info.
-
-        Args:
-            async_request: The async request
-            token: the access_token
-
-        Returns:
-            OIDCUserModel from openid server
-
-        """
-        await self.check_openid_config(async_request)
-        assert self.openid_config
-
-        endpoint = self.openid_config.introspect_endpoint or self.openid_config.introspection_endpoint or ""
-        response = await async_request.post(
-            endpoint,
-            params={"token": token},
-            data={"token": token},
-            auth=BasicAuth(self.resource_server_id, self.resource_server_secret),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-
-        try:
-            data = dict(response.json())
-        except JSONDecodeError:
-            logger.debug(
-                "Unable to parse introspect response",
-                detail=response.text,
-                resource_server_id=self.resource_server_id,
-                openid_url=self.openid_url,
-            )
-            raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED, detail=response.text)
-        logger.debug("Response from openid introspect", response=data)
-
-        if response.status_code not in range(200, 300):
-            logger.debug(
-                "Introspect cannot find an active token, user unauthorized",
-                detail=response.text,
-                resource_server_id=self.resource_server_id,
-                openid_url=self.openid_url,
-            )
-            raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED, detail=response.text)
-
-        return OIDCUserModel(data)
 
 
 async def _get_decision(async_request: AsyncClient, opa_url: str, opa_input: dict) -> OPAResult:
@@ -316,81 +233,17 @@ def _evaluate_decision(decision: OPAResult, auto_error: bool, **context: dict[st
     )
 
 
-def opa_decision(
-    opa_url: str,
-    oidc_security: OIDCUser,
-    auto_error: bool = True,
-    opa_kwargs: Union[Mapping[str, str], None] = None,
-) -> Callable[[Request, OIDCUserModel, AsyncClient], Awaitable[Union[bool, None]]]:
-    async def _opa_decision(
-        request: Request,
-        user_info: OIDCUserModel = Depends(oidc_security),
-        async_request: AsyncClient = Depends(_make_async_client),
-    ) -> Union[bool, None]:
-        """Check OIDCUserModel against the OPA policy.
-
-        This is used as a security module in Fastapi projects
-        This method will make an async call towards the Policy agent.
-
-        Args:
-            request: Request object that will be used to retrieve request metadata.
-            user_info: The OIDCUserModel object that will be checked
-            async_request: The httpx client.
-        """
-
-        if not (oauth2lib_settings.OAUTH2_ACTIVE and oauth2lib_settings.OAUTH2_AUTHORIZATION_ACTIVE):
-            return None
-
-        try:
-            json = await request.json()
-        # Silencing the Decode error or Type error when request.json() does not return anything sane.
-        # Some requests do not have a json response therefore as this code gets called on every request
-        # we need to suppress the `None` case (TypeError) or the `other than json` case (JSONDecodeError)
-        # Suppress AttributeError in case of websocket request, it doesn't have .json
-        except (JSONDecodeError, TypeError, ClientDisconnect, AttributeError, RuntimeError) as e:
-            if isinstance(e, RuntimeError) and "Stream consumed" not in str(e):
-                # RuntimeError is a very broad error class. We only want to catch and ignore a stream
-                # consumed runtime error. In other cases, reraise the error.
-                raise e
-            json = {}
-
-        # defaulting to GET request method for WebSocket request, it doesn't have .method
-        request_method = request.method if hasattr(request, "method") else "GET"
-        opa_input = {
-            "input": {
-                **(opa_kwargs or {}),
-                **user_info,
-                "resource": request.url.path,
-                "method": request_method,
-                "arguments": {"path": request.path_params, "query": {**request.query_params}, "json": json},
-            }
-        }
-
-        decision = await _get_decision(async_request, opa_url, opa_input)
-
-        context = {
-            "resource": opa_input["input"]["resource"],
-            "method": opa_input["input"]["method"],
-            "user_info": user_info,
-            "input": opa_input,
-            "url": request.url,
-        }
-        return _evaluate_decision(decision, auto_error, **context)
-
-    return _opa_decision
-
-
 def opa_graphql_decision(
-    opa_url: str,
-    _oidc_security: OIDCUser,
-    auto_error: bool = False,  # By default don't raise HTTP 403 because partial results are preferred
-    opa_kwargs: Union[Mapping[str, str], None] = None,
-    async_request: Union[AsyncClient, None] = None,
+        opa_url: str,
+        _oidc_security: OIDCAuth,
+        auto_error: bool = False,  # By default don't raise HTTP 403 because partial results are preferred
+        opa_kwargs: Union[Mapping[str, str], None] = None,
+        async_request: Union[AsyncClient, None] = None,
 ) -> Callable[[str, OIDCUserModel], Awaitable[Union[bool, None]]]:
     async def _opa_decision(
-        path: str,
-        oidc_user: OIDCUserModel = Depends(_oidc_security),
-        async_request_1: Union[AsyncClient, None] = None,
+            path: str,
+            oidc_user: OIDCUserModel = Depends(_oidc_security.authenticate),
+            async_request_1: Union[AsyncClient, None] = None,
     ) -> Union[bool, None]:
         """Check OIDCUserModel against the OPA policy.
 
@@ -402,7 +255,7 @@ def opa_graphql_decision(
             oidc_user: The OIDCUserModel object that will be checked
             async_request_1: The Async client
         """
-        if not (oauth2lib_settings.OAUTH2_ACTIVE and oauth2lib_settings.OAUTH2_AUTHORIZATION_ACTIVE):
+        if not oauth2lib_settings.OAUTH2_ACTIVE and not oauth2lib_settings.OAUTH2_AUTHORIZATION_ACTIVE:
             return None
 
         opa_input = {
