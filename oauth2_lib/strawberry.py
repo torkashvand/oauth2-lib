@@ -56,10 +56,10 @@ class OauthContext(BaseContext):
     def __init__(
         self,
         get_current_user: Callable[[Request], Awaitable[OIDCUserModel]],
-        get_opa_decision: Callable[[str, OIDCUserModel], Awaitable[Union[bool, None]]],
+        get_authorization_decision: Callable[[str, OIDCUserModel], Awaitable[Union[bool, None]]],
     ):
         self._get_current_user = get_current_user
-        self.get_opa_decision = get_opa_decision
+        self.get_authorization_decision = get_authorization_decision
         super().__init__()
 
 
@@ -109,9 +109,11 @@ async def is_authorized(info: OauthInfo, path: str) -> bool:
     if not current_user:
         return False
 
-    opa_decision = await context.get_opa_decision(path, current_user)
-    authorized = bool(opa_decision)
-    logger.debug("Received opa decision", path=path, opa_decision=opa_decision, is_authorized=authorized)
+    authorization_decision = await context.get_authorization_decision(path, current_user)
+    authorized = bool(authorization_decision)
+    logger.debug(
+        "Received opa decision", path=path, authorization_decision=authorization_decision, is_authorized=authorized
+    )
 
     return authorized
 
